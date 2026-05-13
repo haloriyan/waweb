@@ -1,4 +1,5 @@
 const express = require('express');
+const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
 const { MessageMedia } = require('whatsapp-web.js');
 const axios = require('axios');
@@ -8,6 +9,7 @@ const path = require('path');
 const { sessions, createSession, destroySession, restoreSessions } = require('./sessions');
 
 const app = express();
+app.use(cors());
 app.use(express.json());
 
 const PORT = process.env.PORT || 6969;
