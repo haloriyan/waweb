@@ -25,65 +25,69 @@ function makeClient(clientId) {
 }
 
 function createSession(clientId, callbackUrl) {
-  const client = makeClient(clientId);
-  const sessionData = { client, status: 'initializing', qrPath: null, callbackUrl };
-  sessions.set(clientId, sessionData);
+  return new Promise((resolve, reject) => {
+    const client = makeClient(clientId);
+    const sessionData = { client, status: 'initializing', qrPath: null, callbackUrl };
+    sessions.set(clientId, sessionData);
 
-  client.on('qr', async (qr) => {
-    const qrPath = path.join(QR_DIR, `qr-${clientId}.png`);
-    try {
-      await qrcode.toFile(qrPath, qr, { type: 'png', width: 300 });
-      sessionData.qrPath = qrPath;
-      sessionData.status = 'qr';
-    } catch (err) {
-      console.error(`[${clientId}] QR generation failed:`, err.message);
-    }
-  });
-
-  client.on('ready', async () => {
-    sessionData.status = 'ready';
-    console.log(`[${clientId}] Session ready`);
-
-    if (!callbackUrl) return;
-
-    try {
-      const info = client.info;
-      const number = info.wid.user;
-      const name = info.pushname;
-
-      let profilePicture = null;
+    client.on('qr', async (qr) => {
+      const qrPath = path.join(QR_DIR, `qr-${clientId}.png`);
       try {
-        profilePicture = await client.getProfilePicUrl(info.wid._serialized);
-      } catch (_) {}
+        await qrcode.toFile(qrPath, qr, { type: 'png', width: 300 });
+        sessionData.qrPath = qrPath;
+        sessionData.status = 'qr';
+        resolve(sessionData);
+      } catch (err) {
+        console.error(`[${clientId}] QR generation failed:`, err.message);
+        reject(err);
+      }
+    });
 
-      await axios.post(callbackUrl, {
-        client_id: clientId,
-        name,
-        number,
-        profile_picture: profilePicture,
-      });
-    } catch (err) {
-      console.error(`[${clientId}] Callback to ${callbackUrl} failed:`, err.message);
-    }
+    client.on('ready', async () => {
+      sessionData.status = 'ready';
+      console.log(`[${clientId}] Session ready`);
+
+      if (!callbackUrl) return;
+
+      try {
+        const info = client.info;
+        const number = info.wid.user;
+        const name = info.pushname;
+
+        let profilePicture = null;
+        try {
+          profilePicture = await client.getProfilePicUrl(info.wid._serialized);
+        } catch (_) {}
+
+        await axios.post(callbackUrl, {
+          client_id: clientId,
+          name,
+          number,
+          profile_picture: profilePicture,
+        });
+      } catch (err) {
+        console.error(`[${clientId}] Callback to ${callbackUrl} failed:`, err.message);
+      }
+    });
+
+    client.on('auth_failure', (msg) => {
+      console.error(`[${clientId}] Auth failure:`, msg);
+      sessionData.status = 'auth_failure';
+      reject(new Error(`Auth failure: ${msg}`));
+    });
+
+    client.on('disconnected', (reason) => {
+      console.log(`[${clientId}] Disconnected:`, reason);
+      sessionData.status = 'disconnected';
+      sessions.delete(clientId);
+    });
+
+    client.initialize().catch((err) => {
+      console.error(`[${clientId}] Initialize error:`, err.message);
+      sessionData.status = 'error';
+      reject(err);
+    });
   });
-
-  client.on('auth_failure', (msg) => {
-    console.error(`[${clientId}] Auth failure:`, msg);
-    sessionData.status = 'auth_failure';
-  });
-
-  client.on('disconnected', (reason) => {
-    console.log(`[${clientId}] Disconnected:`, reason);
-    sessionData.status = 'disconnected';
-    sessions.delete(clientId);
-  });
-
-  client.initialize().catch((err) => {
-    console.error(`[${clientId}] Initialize error:`, err.message);
-    sessionData.status = 'error';
-  });
-
-  return sessionData;
 }
 
 async function destroySession(clientId) {

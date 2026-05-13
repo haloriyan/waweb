@@ -1,133 +1,202 @@
-const express = require('express');
-const cors = require('cors');
-const { v4: uuidv4 } = require('uuid');
-const { MessageMedia } = require('whatsapp-web.js');
-const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
-
-const { sessions, createSession, destroySession, restoreSessions } = require('./sessions');
+const express = require('express');
+const { Client, LocalAuth } = require('whatsapp-web.js');
+const { randomUUID } = require('crypto');
+const QRCode = require('qrcode');
+const { default: axios } = require('axios');
+const cors = require('cors');
 
 const app = express();
-app.use(cors());
 app.use(express.json());
+app.use(cors());
 
-const PORT = process.env.PORT || 2931;
-const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
+const PORT = 6969;
+const SESSIONS_FILE = path.join(__dirname, 'clients.json');
 
-// POST /connect
-// Start a new session and return client_id + QR image URL immediately.
-app.post('/connect', (req, res) => {
-  const { callback_url } = req.body;
-  const clientId = uuidv4();
-  const proto = req.headers['x-forwarded-proto'] || req.protocol;
-  const host = req.headers['x-forwarded-host'] || req.get('host');
-  const baseUrl = `${proto}://${host}`;
-  const qrUrl = `${baseUrl}/qr-image/${clientId}.png`;
+const loadClients = () => {
+    try {
+        let theClients = fs.readFileSync(SESSIONS_FILE);
+        return JSON.parse(theClients) ?? [];
+    } catch (err) {
+        return [];
+    }
+}
+function saveClients(clientIds) {
+	fs.writeFileSync(SESSIONS_FILE, JSON.stringify(clientIds, null, 4));
+}
 
-  createSession(clientId, callback_url || null);
+let clientIds = loadClients();
+let clients = {};
 
-  res.json({ client_id: clientId, qr_url: qrUrl });
+// Restore sessions on server start
+clientIds.forEach((client_id) => {
+	const client = new Client({
+		authStrategy: new LocalAuth({ clientId: client_id }),
+		puppeteer: {
+			headless: true,
+			args: ['--no-sandbox', '--disable-setuid-sandbox']
+		}
+	});
+
+	clients[client_id] = client;
+
+	client.initialize();
+
+	client.on('ready', () => {
+		console.log(`Restored client ${client_id} is ready`);
+	});
+
+	client.on('auth_failure', msg => {
+		console.error(`Client ${client_id} auth failure:`, msg);
+	});
+
+	client.on('disconnected', () => {
+		console.log(`Client ${client_id} disconnected`);
+		delete clients[client_id];
+		const index = clientIds.indexOf(client_id);
+		if (index > -1) {
+			clientIds.splice(index, 1);
+			saveClients(clientIds);
+		}
+	});
+
+    client.on('message', async (msg) => {
+        let chat = await msg.getChat();
+        let contact = await msg.getContact();
+        let message = chat.lastMessage;
+
+        console.log({
+            message,
+            contact,
+        });
+    })
 });
 
-// GET /qr/:client_id
-// Return the latest QR as a base64 data URL (polling fallback).
-app.get('/qr/:clientId', (req, res) => {
-  const { clientId } = req.params;
-  const session = sessions.get(clientId);
+app.post('/connect', async (req, res) => {
+    const clientID = randomUUID();
+    console.log('0');
 
-  if (!session) {
-    return res.status(404).json({ error: 'client not found' });
-  }
+    const client = new Client({
+        puppeteer: {
+            args: ['--no-sandbox'],
+            headless: true
+        },
+        authStrategy: new LocalAuth({
+            clientId: clientID
+        })
+    });
 
-  const qrPath = path.join('/tmp', `qr-${clientId}.png`);
-  if (!session.qrPath || !fs.existsSync(qrPath)) {
-    return res.status(404).json({ error: 'QR not ready yet' });
-  }
+    clients[clientID] = client;
+	clientIds.push(clientID);
+	saveClients(clientIds);
 
-  const data = fs.readFileSync(qrPath);
-  res.json({ qr: `data:image/png;base64,${data.toString('base64')}` });
+    client.on('ready', async () => {
+        console.log('client ready');
+        const { callback_url } = req.body;
+        if (callback_url) {
+            const { wid, pushname } = client.info;
+            const number = wid.user;
+            const profilePicUrl = await client.getProfilePicUrl(wid._serialized);
+
+            const response = await axios.post(callback_url, {
+                client_id: clientID,
+                name: pushname,
+                number,
+                profile_picture: profilePicUrl
+            });
+        }
+    });
+    client.on('qr', async (qr) => {
+        console.log('qr code received');
+        let fileName = clientID + ".png";
+		const filePath = path.join(__dirname, 'public', 'qrcodes', fileName);
+
+		await QRCode.toFile(filePath, qr, {
+			type: 'png',
+			width: 300
+		});
+
+		const qrUrl = `${req.protocol}://${req.get('host')}/qrcodes/${fileName}`;
+
+		console.log('QR Code saved:', qrUrl);
+
+		return res.status(200).json({
+			client_id: clientID,
+			qr_url: qrUrl
+		});
+    })
+
+    client.initialize();
 });
-
-// GET /qr-image/:client_id.png
-// Serve the QR PNG file directly (for img src= usage).
-app.get('/qr-image/:file', (req, res) => {
-  const clientId = req.params.file.replace(/\.png$/i, '');
-  const qrPath = path.join('/tmp', `qr-${clientId}.png`);
-
-  if (!fs.existsSync(qrPath)) {
-    return res.status(404).json({ error: 'QR image not found' });
-  }
-
-  res.setHeader('Content-Type', 'image/png');
-  res.sendFile(qrPath);
-});
-
-// POST /send
-// Send a text message or a text+image message.
 app.post('/send', async (req, res) => {
-  const { client_id, destination, number, message, image } = req.body;
-  const target = destination || number;
+    const { client_id, destination, message, image, button_url, button_text } = req.body;
 
-  if (!client_id || !target || !message) {
-    return res.status(400).json({ ok: false, error: 'client_id, destination and message are required' });
-  }
-
-  const session = sessions.get(client_id);
-  if (!session) {
-    return res.status(404).json({ ok: false, error: 'client not found' });
-  }
-
-  if (session.status !== 'ready') {
-    return res.status(409).json({ ok: false, error: `client not ready (status: ${session.status})` });
-  }
-
-  const chatId = `${target}@c.us`;
-
-  try {
-    if (image) {
-      const response = await axios.get(image, {
-        responseType: 'arraybuffer',
-        timeout: 30_000,
-      });
-      const mimeType = response.headers['content-type'] || 'image/png';
-      const base64Data = Buffer.from(response.data).toString('base64');
-      const media = new MessageMedia(mimeType, base64Data);
-      await session.client.sendMessage(chatId, media, { caption: message });
-    } else {
-      await session.client.sendMessage(chatId, message);
+    if (!client_id || !destination || !message) {
+        return res.status(400).json({
+            status: false,
+            error: 'client_id, destination, and message are required',
+        });
     }
 
-    res.json({ ok: true });
-  } catch (err) {
-    console.error(`[${client_id}] Send error:`, err.message);
-    res.status(500).json({ ok: false, error: err.message });
-  }
+    const client = clients[client_id];
+    if (!client) {
+        return res.status(404).json({
+            status: false,
+            error: 'Client not found or not connected',
+        });
+    }
+
+    const number = destination.includes('@c.us') ? destination : `${destination}@c.us`;
+
+    try {
+        await client.sendPresenceAvailable();
+
+        const chat = await client.getChatById(number);
+        await chat.sendStateTyping();
+
+        // ⏳ Simulate delay (customizable)
+        // await new Promise(resolve => setTimeout(resolve, 2000));
+		const delay = Math.min(message.length * 100, 5000);
+		await new Promise(res => setTimeout(res, delay));
+
+        // ✋ Stop typing
+        await chat.clearState();
+
+        // 📩 Now send the actual message
+        if (image) {
+            const media = await MessageMedia.fromUrl(image);
+            await client.sendMessage(number, media, { caption: message });
+
+        } else if (button_url && typeof button_url === 'string') {
+            const button = new Buttons(
+                message,
+                [{ type: 'url', url: button_url, body: button_text }],
+                'Visit Link',
+                'Footer (opt)'
+            );
+            await client.sendMessage(number, button);
+
+        } else {
+            await client.sendMessage(number, message);
+        }
+
+        return res.status(200).json({
+            status: true,
+            message: 'Message sent with typing simulation'
+        });
+
+    } catch (err) {
+        console.error(err);
+        return res.status(500).json({
+            status: false,
+            error: 'Failed to send message',
+        });
+    }
 });
 
-// POST /disconnect
-// Destroy and remove a session.
-app.post('/disconnect', async (req, res) => {
-  const { client_id } = req.body;
+app.use(express.static(path.join(__dirname, "public")));
 
-  if (!client_id) {
-    return res.status(400).json({ error: 'client_id is required' });
-  }
-
-  const ok = await destroySession(client_id);
-  if (!ok) {
-    return res.status(404).json({ error: 'client not found' });
-  }
-
-  res.json({ ok: true });
-});
-
-// 404 catch-all
-app.use((req, res) => {
-  res.status(404).json({ error: 'not found' });
-});
-
-app.listen(PORT, async () => {
-  console.log(`WhatsApp gateway running on port ${PORT} (base: ${BASE_URL})`);
-  await restoreSessions();
-});
+app.listen(PORT, () => {
+    console.log('[EXPRESS] Running on ', PORT);
+})
