@@ -20,7 +20,10 @@ const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\
 app.post('/connect', (req, res) => {
   const { callback_url } = req.body;
   const clientId = uuidv4();
-  const qrUrl = `${BASE_URL}/qr-image/${clientId}.png`;
+  const proto = req.headers['x-forwarded-proto'] || req.protocol;
+  const host = req.headers['x-forwarded-host'] || req.get('host');
+  const baseUrl = `${proto}://${host}`;
+  const qrUrl = `${baseUrl}/qr-image/${clientId}.png`;
 
   createSession(clientId, callback_url || null);
 
