@@ -10,7 +10,7 @@ const { sessions, createSession, destroySession, restoreSessions } = require('./
 const app = express();
 app.use(express.json());
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 6969;
 const BASE_URL = (process.env.BASE_URL || `http://localhost:${PORT}`).replace(/\/$/, '');
 
 // POST /connect
